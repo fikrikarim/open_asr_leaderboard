@@ -1,0 +1,230 @@
+import argparse
+import os
+import torch
+from transformers import AutoProcessor, AutoModelForMultimodalLM
+import evaluate
+from normalizer import data_utils
+import time
+from tqdm import tqdm
+
+wer_metric = evaluate.load("wer")
+
+
+def main(args):
+    # Load Gemma 4 multimodal model. `AutoModelForMultimodalLM` is the
+    # audio-capable class documented in the model card.
+    print(f"Loading model: {args.model_id}")
+    processor = AutoProcessor.from_pretrained(args.model_id)
+    # Left padding is required for correct batched decoder-only generation.
+    processor.tokenizer.padding_side = "left"
+
+    model = AutoModelForMultimodalLM.from_pretrained(
+        args.model_id,
+        torch_dtype=torch.bfloat16,
+        device_map=f"cuda:{args.device}" if args.device >= 0 else "cpu",
+    )
+    model.eval()
+    print(f"Model size: {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
+
+    def benchmark(batch, min_new_tokens=None):
+        # Load audio inputs
+        audios = [audio["array"] for audio in batch["audio"]]
+        minibatch_size = len(audios)
+        batch["audio_filepath"] = data_utils.extract_audio_filepaths_from_batch(batch, minibatch_size)
+        batch["audio_length_s"] = [len(audio["array"]) / audio["sampling_rate"] for audio in batch["audio"]]
+
+        # Build one chat conversation per audio sample. Audio is placed after the
+        # text instruction, as recommended by the Gemma 4 model card.
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": args.user_prompt},
+                        {"type": "audio", "audio": audio},
+                    ],
+                }
+            ]
+            for audio in audios
+        ]
+
+        # START TIMING
+        start_time = time.time()
+
+        # INFERENCE
+        inputs = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            add_generation_prompt=True,
+            padding=True,
+        ).to(model.device, dtype=torch.bfloat16)
+
+        # Number of prompt tokens (uniform across the batch thanks to left padding)
+        input_len = inputs["input_ids"].shape[1]
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                do_sample=False,
+            )
+
+        # Keep only newly generated tokens, then decode to text
+        pred_text = processor.batch_decode(
+            outputs[:, input_len:], skip_special_tokens=True
+        )
+
+        # END TIMING
+        runtime = time.time() - start_time
+
+        # normalize by minibatch size since we want the per-sample time
+        batch["transcription_time_s"] = minibatch_size * [runtime / minibatch_size]
+
+        batch["predictions"] = pred_text  # raw; normalization applied at scoring time
+        batch["references"] = batch["original_text"]  # raw; normalization applied at scoring time
+        return batch
+
+    if args.warmup_steps is not None:
+        warmup_dataset = data_utils.load_data(args)
+        warmup_dataset = data_utils.prepare_data(warmup_dataset)
+
+        num_warmup_samples = args.warmup_steps * args.batch_size
+        if args.streaming:
+            warmup_dataset = warmup_dataset.take(num_warmup_samples)
+        else:
+            warmup_dataset = warmup_dataset.select(range(min(num_warmup_samples, len(warmup_dataset))))
+        warmup_dataset = iter(warmup_dataset.map(benchmark, batch_size=args.batch_size, batched=True, fn_kwargs={"min_new_tokens": args.max_new_tokens}))
+
+        for _ in tqdm(warmup_dataset, desc="Warming up..."):
+            continue
+
+    dataset = data_utils.load_data(args)
+    dataset = data_utils.prepare_data(dataset)
+
+    if args.max_eval_samples is not None and args.max_eval_samples > 0:
+        print(f"Subsampling dataset to first {args.max_eval_samples} samples!")
+        if args.streaming:
+            dataset = dataset.take(args.max_eval_samples)
+        else:
+            dataset = dataset.select(range(min(args.max_eval_samples, len(dataset))))
+
+    dataset = dataset.map(
+        benchmark, batch_size=args.batch_size, batched=True, remove_columns=["audio"],
+    )
+
+    all_results = {
+        "audio_length_s": [],
+        "transcription_time_s": [],
+        "predictions": [],
+        "references": [],
+        "audio_filepath": [],
+    }
+    result_iter = iter(dataset)
+    for result in tqdm(result_iter, desc="Samples..."):
+        for key in all_results:
+            all_results[key].append(result[key])
+
+    # Write manifest results (WER and RTFX)
+    manifest_path = data_utils.write_manifest(
+        all_results["references"],
+        all_results["predictions"],
+        args.model_id,
+        args.dataset_path,
+        args.dataset,
+        args.split,
+        audio_length=all_results["audio_length_s"],
+        transcription_time=all_results["transcription_time_s"],
+        audio_filepaths=all_results["audio_filepath"],
+    )
+    print("Results saved at path:", os.path.abspath(manifest_path))
+
+    norm_refs = [data_utils.normalizer(r) for r in all_results["references"]]
+    norm_preds = [data_utils.normalizer(p) for p in all_results["predictions"]]
+    wer = wer_metric.compute(
+        references=norm_refs, predictions=norm_preds
+    )
+    wer = round(100 * wer, 2)
+    rtfx = round(sum(all_results["audio_length_s"]) / sum(all_results["transcription_time_s"]), 2)
+    print("WER:", wer, "%", "RTFx:", rtfx)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model_id",
+        type=str,
+        required=True,
+        help="Model identifier. Should be loadable with transformers (e.g., 'google/gemma-4-E4B-it')",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default="hf-audio/open-asr-leaderboard",
+        help="Dataset path. By default, it is `hf-audio/open-asr-leaderboard`",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="Dataset name. *E.g.* `'librispeech_asr` for the LibriSpeech ASR dataset, or `'common_voice'` for Common Voice. The full list of dataset names "
+        "can be found at `https://huggingface.co/datasets/hf-audio/open-asr-leaderboard`",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="test",
+        help="Split of the dataset. *E.g.* `'validation`' for the dev split, or `'test'` for the test split.",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=-1,
+        help="The device to run the pipeline on. -1 for CPU (default), 0 for the first GPU and so on.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Number of samples to go through each streamed batch.",
+    )
+    parser.add_argument(
+        "--max_eval_samples",
+        type=int,
+        default=None,
+        help="Number of samples to be evaluated. Put a lower number e.g. 64 for testing this script.",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Stream the dataset lazily over the network instead of downloading it in full before the evaluation. Off by default for reproducible benchmark timings.",
+    )
+    parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=256,
+        help="Maximum number of tokens to generate.",
+    )
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=10,
+        help="Number of warm-up steps to run before launching the timed runs.",
+    )
+    parser.add_argument(
+        "--user_prompt",
+        type=str,
+        default=(
+            "Transcribe the following speech segment in English. Follow these specific "
+            "instructions for formatting the answer:\n* Only output the transcription, with no newlines."
+            "\n* When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, "
+            "and write 3 instead of three."
+        ),
+        help="User prompt string.",
+    )
+    args = parser.parse_args()
+
+    main(args)
