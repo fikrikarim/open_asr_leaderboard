@@ -1,0 +1,17 @@
+# Verified stack for evaluating google/gemma-4-E4B-it (model_type "gemma4").
+#
+#  * transformers: needs Gemma4 support (AutoModelForMultimodalLM); 5.12.1 tested.
+#  * torch>=2.6: the gemma4 audio tower's bidirectional mask uses
+#    `or_mask_function`, which requires torch>=2.6 (2.5.x raises a ValueError).
+#  * torchvision/torchaudio: must match the torch build; transformers imports
+#    torchaudio at load time, so a mismatched build breaks `import transformers`.
+#  * datasets<4: keeps the soundfile-based audio decode path. datasets>=4 drops
+#    it and requires `torchcodec` instead (install that if you prefer datasets>=4).
+transformers>=5.12.1
+torch==2.6.0
+torchvision==0.21.0
+torchaudio==2.6.0
+datasets==3.6.0
+accelerate
+librosa
+soundfile
